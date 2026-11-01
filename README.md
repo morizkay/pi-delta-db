@@ -63,6 +63,18 @@ For local development of this repository, link it into the agent directory inste
 ln -sfn "$(pwd)" ~/.pi/agent/extensions/pi-delta-db
 ```
 
+### GitHub Packages mirror
+
+Every release is also mirrored to GitHub Packages as `@morizkay/pi-delta-db` by
+[`.github/workflows/publish-github-packages.yml`](./.github/workflows/publish-github-packages.yml),
+which is why the repository's Packages tab lists it. Prefer npm: GitHub Packages requires a token
+with `read:packages` even for public packages.
+
+```bash
+# ~/.npmrc: //npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+pi install npm:@morizkay/pi-delta-db
+```
+
 ## Development
 
 ```bash
