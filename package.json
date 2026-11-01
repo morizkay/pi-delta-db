@@ -1,0 +1,12 @@
+{
+  "name": "pi-delta-db",
+  "version": "0.1.0",
+  "description": "Store and read Pi data through the Delta CLI (private Delta threads + read-only db inspection)",
+  "type": "module",
+  "main": "index.ts",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
