@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,9 +20,69 @@ const STATE_DIR = path.join(os.homedir(), ".pi", "agent", "delta-db");
 const MAX_CHARS = 12_000;
 const TIMEOUT_MS = 120_000;
 
-type Json = Record<string, any>;
+interface Org {
+	id: string;
+	current?: boolean;
+}
+interface ThreadListItem {
+	index?: number;
+	id: string;
+	name?: string;
+	summary?: string;
+}
+interface ThreadStatus {
+	producer?: { next_sequence?: number };
+	url?: string;
+	title?: string;
+}
+interface ThreadShow {
+	id?: string;
+	name?: string;
+	transcript?: string;
+	buffer?: string;
+}
+interface Stats {
+	schema_version?: number;
+	node_count?: number;
+	node_compressed_bytes?: number;
+	node_types?: { type: string; count: number; compressed_bytes: number }[];
+	roots?: { id: string; type: string }[];
+}
+interface ContentBlock {
+	type?: string;
+	text?: string;
+}
+interface FinalMessage {
+	role?: string;
+	content?: string | ContentBlock[];
+}
+interface Update {
+	sessionUpdate: string;
+	messageId?: string;
+	title?: string;
+	content?: { type: string; text: string }[];
+}
 
-function delta(args: string[], input?: string): Promise<any> {
+/** A session's Delta thread binding. `titled` keeps a continued session from renaming it. */
+interface Binding {
+	threadId: string;
+	titled?: boolean;
+}
+
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+/** Parse CLI output at its boundary; unparseable text becomes undefined. */
+function parseJson(text: string): JsonValue | undefined {
+	if (!text.trim()) return undefined;
+	try {
+		return JSON.parse(text) as JsonValue;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Run `delta`, returning stdout, and turn a failed exit into an Error. */
+function run(args: string[], input?: string): Promise<string> {
 	return new Promise((resolve, reject) => {
 		const child = spawn("delta", args, { stdio: ["pipe", "pipe", "pipe"] });
 		let out = "";
@@ -35,22 +96,23 @@ function delta(args: string[], input?: string): Promise<any> {
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
-			if (code !== 0) {
-				let message = err.trim();
-				try {
-					message = JSON.parse(out).error?.message ?? message;
-				} catch {}
-				reject(new Error(message || `delta ${args.slice(0, 2).join(" ")} exited ${code}`));
+			if (code === 0) {
+				resolve(out);
 				return;
 			}
-			try {
-				resolve(JSON.parse(out));
-			} catch {
-				resolve(out.trim());
-			}
+			// With --json the CLI prints {error:{message}} on stdout; prefer that over stderr noise.
+			const reported = (parseJson(out) as { error?: { message?: string } } | undefined)?.error?.message;
+			reject(new Error(reported ?? err.trim() ?? `delta ${args.slice(0, 2).join(" ")} exited ${code}`));
 		});
 		child.stdin.end(input);
 	});
+}
+
+async function json<T>(args: string[], input?: string): Promise<T> {
+	const out = await run(args, input);
+	const value = parseJson(out);
+	if (value === undefined) throw new Error(`delta ${args.slice(0, 2).join(" ")} returned no JSON`);
+	return value as T;
 }
 
 function clip(text: string, limit = MAX_CHARS): string {
@@ -59,25 +121,43 @@ function clip(text: string, limit = MAX_CHARS): string {
 
 /** A stable producer key for this Pi session; also the on-disk binding name. */
 function sessionKey(ctx: ExtensionContext): string {
-	const manager = ctx.sessionManager as any;
+	// SAFETY: Pi's session manager exposes these getters at runtime; the public
+	// ExtensionContext type does not declare them, so only their presence is assumed.
+	const manager = ctx.sessionManager as unknown as {
+		getSessionId?: () => string;
+		getSessionFile?: () => string;
+	};
 	const raw = manager?.getSessionId?.() ?? manager?.getSessionFile?.() ?? `cwd-${ctx.cwd}`;
 	const tail = String(raw).split(/[\\/]/).pop() ?? "session";
 	return tail.replace(/[^A-Za-z0-9_-]/g, "-");
 }
 
-function bindingFile(key: string) {
+function bindingFile(key: string): string {
 	return path.join(STATE_DIR, `${key}.json`);
 }
 
-async function ensureThread(key: string): Promise<string> {
+function readBinding(key: string): Binding | undefined {
 	try {
-		const saved = JSON.parse(fs.readFileSync(bindingFile(key), "utf8"));
-		if (saved.threadId) return saved.threadId;
-	} catch {}
-	const orgs = await delta(["org", "list", "--json"]);
-	const org = orgs.organizations?.find((item: Json) => item.current) ?? orgs.organizations?.[0];
+		const saved = parseJson(fs.readFileSync(bindingFile(key), "utf8")) as Binding | undefined;
+		return saved?.threadId ? saved : undefined;
+	} catch {
+		// No binding file yet: this session has never written to Delta.
+		return undefined;
+	}
+}
+
+function writeBinding(key: string, binding: Binding): void {
+	fs.mkdirSync(STATE_DIR, { recursive: true });
+	fs.writeFileSync(bindingFile(key), JSON.stringify(binding, null, 2));
+}
+
+async function ensureThread(key: string): Promise<Binding> {
+	const bound = readBinding(key);
+	if (bound) return bound;
+	const { organizations } = await json<{ organizations?: Org[] }>(["org", "list", "--json"]);
+	const org = organizations?.find((item) => item.current) ?? organizations?.[0];
 	if (!org) throw new Error("No Delta organization. Run `delta auth login`, then retry.");
-	const created = await delta([
+	const created = await json<{ thread_id: string }>([
 		"thread",
 		"create",
 		"--source",
@@ -90,31 +170,49 @@ async function ensureThread(key: string): Promise<string> {
 		org.id,
 		"--json",
 	]);
-	fs.mkdirSync(STATE_DIR, { recursive: true });
-	fs.writeFileSync(bindingFile(key), JSON.stringify({ threadId: created.thread_id }, null, 2));
-	return created.thread_id;
+	const binding: Binding = { threadId: created.thread_id };
+	writeBinding(key, binding);
+	return binding;
 }
 
-async function statusOf(key: string, threadId: string): Promise<Json> {
-	return delta(["thread", "status", "--source", SOURCE, "--external-id", key, "--json", threadId]);
+function statusOf(key: string, threadId: string): Promise<ThreadStatus> {
+	return json<ThreadStatus>(["thread", "status", "--source", SOURCE, "--external-id", key, "--json", threadId]);
 }
 
 /** Append schema-1 records, continuing this producer's sequence. */
-async function append(key: string, threadId: string, updates: Json[]) {
+async function append(key: string, threadId: string, updates: Update[]) {
 	const status = await statusOf(key, threadId);
 	let sequence = status.producer?.next_sequence;
 	if (!Number.isSafeInteger(sequence)) throw new Error("Delta did not report the next sequence for this thread");
 	const lines = updates
 		.map((update) => JSON.stringify({ schemaVersion: 1, sequence: sequence++, update }))
 		.join("\n");
-	await delta(
+	await run(
 		["thread", "append", "--source", SOURCE, "--external-id", key, "--acknowledge", "local", "--json", threadId],
 		`${lines}\n`,
 	);
-	return { count: updates.length, nextSequence: sequence, url: status.url as string | undefined };
+	return { count: updates.length, nextSequence: sequence, url: status.url };
 }
 
-function summarizeList(threads: Json[]): string {
+/** Text of a finalized message; only text blocks are recorded. */
+// shortcut: thinking and tool calls are not recorded, add them when the transcript needs them
+function messageText(message: FinalMessage): string {
+	const content = message?.content;
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((block) => block?.type === "text" && typeof block.text === "string")
+		.map((block) => String(block.text))
+		.join("\n")
+		.trim();
+}
+
+function firstLine(text: string): string {
+	const line = text.split("\n").find((part) => part.trim()) ?? "";
+	return line.trim().slice(0, 60);
+}
+
+function summarizeList(threads: ThreadListItem[]): string {
 	if (!threads.length) return "No Delta threads yet.";
 	return threads
 		.map((thread) => {
@@ -126,6 +224,62 @@ function summarizeList(threads: Json[]): string {
 }
 
 export default function (pi: ExtensionAPI) {
+	// One writer at a time: sequence numbers come from `thread status`, so overlapping
+	// appends would reuse a sequence and Delta would reject them.
+	let queue: Promise<unknown> = Promise.resolve();
+	function enqueue<T>(task: () => Promise<T>): Promise<T> {
+		const queued = queue.then(task, task);
+		queue = queued.catch(() => {});
+		return queued;
+	}
+
+	let rec: { key: string; enabled: boolean; warned: boolean } | null = null;
+
+	const sessionOf = (ctx: ExtensionContext) =>
+		(rec ??= { key: sessionKey(ctx), enabled: process.env.PI_DELTA_RECORD !== "0", warned: false });
+
+	pi.on("session_start", (_event, ctx) => {
+		rec = { key: sessionKey(ctx), enabled: process.env.PI_DELTA_RECORD !== "0", warned: false };
+	});
+
+	// Auto-record every finalized user and assistant message into this session's thread.
+	pi.on("message_end", (event, ctx) => {
+		const current = sessionOf(ctx);
+		if (!current.enabled) return;
+		const message = event.message as FinalMessage;
+		if (message?.role !== "user" && message?.role !== "assistant") return;
+		const text = messageText(message);
+		if (!text) return;
+		const wantsTitle = message.role === "user" ? firstLine(text) : undefined;
+		enqueue(async () => {
+			try {
+				const binding = await ensureThread(current.key);
+				const updates: Update[] = [];
+				// A messageId must be globally unique: Delta replaces an existing record with the same id.
+				if (wantsTitle && !binding.titled) {
+					updates.push({ sessionUpdate: "session_info_update", title: wantsTitle });
+					binding.titled = true;
+					writeBinding(current.key, binding);
+				}
+				updates.push({
+					sessionUpdate: message.role === "user" ? "user_message" : "agent_message",
+					messageId: `${current.key}:${randomUUID()}`,
+					content: [{ type: "text", text }],
+				});
+				await append(current.key, binding.threadId, updates);
+			} catch (error) {
+				if (current.warned) return;
+				current.warned = true;
+				ctx.ui.notify(`Delta recording stopped: ${(error as Error).message}`, "warning");
+			}
+		});
+	});
+
+	pi.on("session_shutdown", async () => {
+		// Let the tail of the queue reach Delta before the process exits.
+		await Promise.race([queue, new Promise((resolve) => setTimeout(resolve, 8000))]);
+	});
+
 	pi.registerTool({
 		name: "delta_store",
 		label: "Delta Store",
@@ -139,25 +293,31 @@ export default function (pi: ExtensionAPI) {
 			title: Type.Optional(Type.String({ description: "Set the thread title when given" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const key = sessionKey(ctx);
-			const threadId = await ensureThread(key);
-			const updates: Json[] = [];
-			if (params.title) updates.push({ sessionUpdate: "session_info_update", title: params.title });
-			updates.push({
-				sessionUpdate: params.role === "user" ? "user_message" : "agent_message",
-				messageId: `pi:${key}:${Date.now()}`,
-				content: [{ type: "text", text: params.text }],
+			const key = sessionOf(ctx).key;
+			const result = await enqueue(async () => {
+				const binding = await ensureThread(key);
+				const updates: Update[] = [];
+				if (params.title && !binding.titled) {
+					updates.push({ sessionUpdate: "session_info_update", title: params.title });
+					binding.titled = true;
+					writeBinding(key, binding);
+				}
+				updates.push({
+					sessionUpdate: params.role === "user" ? "user_message" : "agent_message",
+					messageId: `${key}:${randomUUID()}`,
+					content: [{ type: "text", text: params.text }],
+				});
+				return { ...(await append(key, binding.threadId, updates)), threadId: binding.threadId };
 			});
-			const result = await append(key, threadId, updates);
 			const where = result.url ? ` ${result.url}` : "";
 			return {
 				content: [
 					{
 						type: "text",
-						text: `Stored ${result.count} record(s) in Delta thread ${threadId} (next sequence ${result.nextSequence}).${where}`,
+						text: `Stored ${result.count} record(s) in Delta thread ${result.threadId} (next sequence ${result.nextSequence}).${where}`,
 					},
 				],
-				details: { threadId, ...result },
+				details: { ...result },
 			};
 		},
 	});
@@ -174,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (params.action === "list") {
-				const threads = await delta(["thread", "list", "--json"]);
+				const threads = await json<ThreadListItem[]>(["thread", "list", "--json"]);
 				return {
 					content: [{ type: "text", text: summarizeList(threads) }],
 					details: { action: "list", count: threads.length },
@@ -183,21 +343,16 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "search") {
 				if (!params.query?.trim()) throw new Error("query is required for search");
 				const words = params.query.trim().split(/\s+/);
-				const threads = await delta(["thread", "search", "-n", "20", "--json", ...words]);
+				const threads = await json<ThreadListItem[]>(["thread", "search", "-n", "20", "--json", ...words]);
 				return {
 					content: [{ type: "text", text: summarizeList(threads) }],
 					details: { action: "search", query: params.query, count: threads.length },
 				};
 			}
-			const key = sessionKey(ctx);
-			let thread = params.thread?.trim();
-			if (!thread) {
-				try {
-					thread = JSON.parse(fs.readFileSync(bindingFile(key), "utf8")).threadId;
-				} catch {}
-			}
+			const bound = readBinding(sessionOf(ctx).key);
+			const thread = params.thread?.trim() || bound?.threadId;
 			if (!thread) throw new Error("thread is required for show (this session has no Delta thread yet)");
-			const [shown] = await delta(["thread", "show", thread, "--format", "summarize", "--json"]);
+			const [shown] = await json<ThreadShow[]>(["thread", "show", thread, "--format", "summarize", "--json"]);
 			const body = shown?.transcript ?? shown?.buffer ?? "(empty)";
 			return {
 				content: [{ type: "text", text: clip(`# ${shown?.name ?? thread}\n\n${body}`) }],
@@ -217,11 +372,11 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate) {
 			if (params.action === "stats") {
-				const stats = await delta(["db", "stats", "--json"]);
+				const stats = await json<Stats>(["db", "stats", "--json"]);
 				const types = (stats.node_types ?? [])
-					.map((item: Json) => `${item.type}: ${item.count} nodes, ${item.compressed_bytes} B`)
+					.map((item) => `${item.type}: ${item.count} nodes, ${item.compressed_bytes} B`)
 					.join("\n");
-				const roots = (stats.roots ?? []).map((item: Json) => `${item.id} ${item.type}`).join("\n");
+				const roots = (stats.roots ?? []).map((item) => `${item.id} ${item.type}`).join("\n");
 				return {
 					content: [
 						{
@@ -235,7 +390,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			if (!params.id) throw new Error("id is required for root");
-			const decoded = await delta(["db", "root", params.id, "--json"]);
+			const decoded = await json<{ type?: string }>(["db", "root", params.id, "--json"]);
 			return {
 				content: [{ type: "text", text: clip(JSON.stringify(decoded, null, 2)) }],
 				details: { action: "root", id: params.id, type: decoded?.type },
@@ -244,19 +399,26 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("delta", {
-		description: "Show this session's Delta thread",
-		handler: async (_args, ctx) => {
-			const key = sessionKey(ctx);
-			let threadId: string | undefined;
-			try {
-				threadId = JSON.parse(fs.readFileSync(bindingFile(key), "utf8")).threadId;
-			} catch {}
-			if (!threadId) {
-				ctx.ui.notify("No Delta thread for this session yet — ask Pi to delta_store something.", "info");
+		description: "Show or toggle this session's Delta recording",
+		handler: async (args, ctx) => {
+			const current = sessionOf(ctx);
+			const arg = args.trim().toLowerCase();
+			if (arg === "on" || arg === "off") {
+				current.enabled = arg === "on";
+				ctx.ui.notify(`Delta recording ${arg}`, "info");
 				return;
 			}
-			const status = await statusOf(key, threadId);
-			ctx.ui.notify(`${status.title ?? threadId}\n${status.url ?? ""}`, "info");
+			const threadId = readBinding(current.key);
+			const lines = [
+				`Recording: ${current.enabled ? "on" : "off"} (/delta on|off)`,
+				threadId ? `Thread: ${threadId}` : "Thread: none yet",
+			];
+			if (threadId) {
+				const status = await statusOf(current.key, threadId);
+				if (status.title) lines.push(`Title: ${status.title}`);
+				if (status.url) lines.push(status.url);
+			}
+			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 }
