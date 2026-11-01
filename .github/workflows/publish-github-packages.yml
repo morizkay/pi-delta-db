@@ -1,0 +1,34 @@
+name: Publish to GitHub Packages
+
+# Mirrors the npm release into GitHub Packages (@morizkay scope) so the repository's
+# Packages tab lists it. npmjs.org stays the installable channel: GitHub Packages
+# requires a token even for public packages.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: "@morizkay"
+
+      # GitHub Packages requires the package name to be scoped to the repository owner.
+      - name: Scope the package name
+        run: npm pkg set name=@morizkay/pi-delta-db
+
+      - name: Publish
+        run: npm publish --registry https://npm.pkg.github.com
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
