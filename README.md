@@ -1,5 +1,8 @@
 # pi-delta-db
 
+[![npm](https://img.shields.io/npm/v/pi-delta-db.svg)](https://www.npmjs.com/package/pi-delta-db)
+[![license](https://img.shields.io/npm/l/pi-delta-db.svg)](./LICENSE)
+
 Pi extension that lets Pi store and read data through the [Delta](https://delta.dev) CLI (`delta`).
 
 Delta's SQLite store behind `delta db` is internal and read-only from outside, so writes go
@@ -43,10 +46,29 @@ One thread per Pi session:
 ## Install
 
 ```bash
+# from npm
+pi install npm:pi-delta-db
+
+# from git, or a local checkout in development
+pi install git:github.com/morizkay/pi-delta-db
+pi install ./pi-delta-db
+```
+
+Restart Pi (or run `/reload`). Requirements: Pi `>= 1.4.0`, Node `>= 22.19.0`, the `delta` CLI
+on `PATH`, and a signed-in account (`delta auth login`).
+
+For local development of this repository, link it into the agent directory instead:
+
+```bash
 ln -sfn "$(pwd)" ~/.pi/agent/extensions/pi-delta-db
 ```
 
-Restart Pi (or `/reload`). Requirements: `delta` on `PATH`, signed in (`delta auth login`).
+## Development
+
+```bash
+npm install    # host packages are peer dependencies, dev-only here
+npm run check  # tsc --noEmit
+```
 
 ## Gotchas found against delta 0.23.0
 
@@ -56,3 +78,7 @@ Restart Pi (or `/reload`). Requirements: `delta` on `PATH`, signed in (`delta au
   remembered in the binding file.
 - Appends send records to Delta's cloud (private visibility) — not purely local storage.
 - Records are append-only: nothing can be overwritten or deleted individually.
+
+## License
+
+[MIT](./LICENSE) © 2026 morizkay. Changes are documented in the [changelog](./CHANGELOG.md).

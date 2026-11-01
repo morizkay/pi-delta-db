@@ -1,12 +1,59 @@
 {
   "name": "pi-delta-db",
   "version": "0.1.0",
-  "description": "Store and read Pi data through the Delta CLI (private Delta threads + read-only db inspection)",
+  "description": "Pi extension that stores and reads Pi session data through the Delta CLI: auto-recorded Delta threads plus read-only inspection of Delta's local store",
+  "license": "MIT",
   "type": "module",
   "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "delta",
+    "delta-cli",
+    "recording",
+    "transcript",
+    "threads"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
     ]
-  }
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.4.0",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@types/node": "^24.10.1",
+    "typebox": "^1.4.3",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/morizkay/pi-delta-db.git"
+  },
+  "homepage": "https://github.com/morizkay/pi-delta-db#readme",
+  "bugs": {
+    "url": "https://github.com/morizkay/pi-delta-db/issues"
+  },
+  "author": "morizkay"
 }

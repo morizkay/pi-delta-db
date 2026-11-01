@@ -121,13 +121,7 @@ function clip(text: string, limit = MAX_CHARS): string {
 
 /** A stable producer key for this Pi session; also the on-disk binding name. */
 function sessionKey(ctx: ExtensionContext): string {
-	// SAFETY: Pi's session manager exposes these getters at runtime; the public
-	// ExtensionContext type does not declare them, so only their presence is assumed.
-	const manager = ctx.sessionManager as unknown as {
-		getSessionId?: () => string;
-		getSessionFile?: () => string;
-	};
-	const raw = manager?.getSessionId?.() ?? manager?.getSessionFile?.() ?? `cwd-${ctx.cwd}`;
+	const raw = ctx.sessionManager.getSessionId() || ctx.sessionManager.getSessionFile() || `cwd-${ctx.cwd}`;
 	const tail = String(raw).split(/[\\/]/).pop() ?? "session";
 	return tail.replace(/[^A-Za-z0-9_-]/g, "-");
 }
@@ -182,8 +176,10 @@ function statusOf(key: string, threadId: string): Promise<ThreadStatus> {
 /** Append schema-1 records, continuing this producer's sequence. */
 async function append(key: string, threadId: string, updates: Update[]) {
 	const status = await statusOf(key, threadId);
-	let sequence = status.producer?.next_sequence;
-	if (!Number.isSafeInteger(sequence)) throw new Error("Delta did not report the next sequence for this thread");
+	const first = status.producer?.next_sequence;
+	if (first === undefined || !Number.isSafeInteger(first))
+		throw new Error("Delta did not report the next sequence for this thread");
+	let sequence = first;
 	const lines = updates
 		.map((update) => JSON.stringify({ schemaVersion: 1, sequence: sequence++, update }))
 		.join("\n");
@@ -408,13 +404,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Delta recording ${arg}`, "info");
 				return;
 			}
-			const threadId = readBinding(current.key);
+			const binding = readBinding(current.key);
 			const lines = [
 				`Recording: ${current.enabled ? "on" : "off"} (/delta on|off)`,
-				threadId ? `Thread: ${threadId}` : "Thread: none yet",
+				binding ? `Thread: ${binding.threadId}` : "Thread: none yet",
 			];
-			if (threadId) {
-				const status = await statusOf(current.key, threadId);
+			if (binding) {
+				const status = await statusOf(current.key, binding.threadId);
 				if (status.title) lines.push(`Title: ${status.title}`);
 				if (status.url) lines.push(status.url);
 			}
