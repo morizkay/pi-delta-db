@@ -12,17 +12,23 @@ in the Delta app and can be read back with or without Pi.
 
 ## Auto-recording
 
-Every finalized user and assistant message is appended to this session's Delta thread
-automatically, in order. The thread is created on the first message and titled with the first
-prompt; continuing a session (`pi -c`) keeps appending to the same thread.
+Every finalized user message, assistant message, thought, tool call, and tool result is
+appended to this session's Delta thread, in order. The thread is created on the first message
+and titled with the first prompt; continuing a session (`pi -c`) keeps appending to the same thread.
+
+Records are written to `~/.pi/agent/delta-db/outbox/` and fsynced before Delta is contacted.
+If Delta is closed, offline, or rejects the write, the turn stays queued and is retried on the
+next message and the next session start. A retry cannot duplicate or erase earlier turns:
+each message id is unique, and Delta replaces a record that reuses one.
 
 | Control | Effect |
 | --- | --- |
-| `/delta` | Show recording state, thread id, title, share URL |
-| `/delta off` / `/delta on` | Toggle recording for this session |
-| `PI_DELTA_RECORD=0` | Start Pi with recording off |
+| `/delta` | Show recording state, thread id, queued count, title, share URL |
+| `/delta off` / `/delta on` | Toggle recording for this session, remembered next start |
+| `PI_DELTA_RECORD=0` | Start Pi with recording off for this process |
 
-Only text is recorded — thinking blocks and tool calls are skipped.
+Bindings whose Pi session file is gone and that have not been touched for a week are deleted
+on session start.
 
 ## Tools
 
@@ -80,7 +86,12 @@ pi install npm:@morizkay/pi-delta-db
 ```bash
 npm install    # host packages are peer dependencies, dev-only here
 npm run check  # tsc --noEmit
+npm test       # record shapes, outbox retry, and prune, against a fake delta
 ```
+
+CI runs both on every push. Publishing a GitHub release also mirrors the package to GitHub
+Packages, and publishes to npmjs.org when the `NPM_TOKEN` secret is set
+(`gh secret set NPM_TOKEN`; use an automation token so OTP is not required).
 
 ## Gotchas found against delta 0.23.0
 

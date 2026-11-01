@@ -1,0 +1,55 @@
+#!/usr/bin/env node
+// Fake `delta` for tests. State lives in PI_FAKE_DELTA_DIR. Append fails while PI_FAKE_DELTA_FAIL=1.
+import fs from "node:fs";
+import path from "node:path";
+
+const dir = process.env.PI_FAKE_DELTA_DIR;
+if (!dir) {
+	console.error("PI_FAKE_DELTA_DIR unset");
+	process.exit(1);
+}
+const file = path.join(dir, "state.json");
+const state = fs.existsSync(file)
+	? JSON.parse(fs.readFileSync(file, "utf8"))
+	: { next: 1, threadId: "thread_test", log: [] };
+const save = () => fs.writeFileSync(file, JSON.stringify(state));
+
+const args = process.argv.slice(2);
+const sub = args[1];
+if (process.env.PI_FAKE_DELTA_FAIL === "1" && sub === "append") {
+	console.log(JSON.stringify({ error: { message: "fake down" } }));
+	process.exit(1);
+}
+if (args[0] === "org" && sub === "list") {
+	console.log(JSON.stringify({ organizations: [{ id: "org_test", current: true }] }));
+	process.exit(0);
+}
+if (args[0] === "thread" && sub === "create") {
+	save();
+	console.log(JSON.stringify({ operation: "created", thread_id: state.threadId, created: true }));
+	process.exit(0);
+}
+if (args[0] === "thread" && sub === "status") {
+	console.log(JSON.stringify({ producer: { next_sequence: state.next }, url: "https://delta.example/t", title: state.title ?? null }));
+	process.exit(0);
+}
+if (args[0] === "thread" && sub === "append") {
+	const lines = fs.readFileSync(0, "utf8").split("\n").filter(Boolean);
+	let sequence = state.next;
+	for (const line of lines) {
+		const record = JSON.parse(line);
+		if (record.schemaVersion !== 1 || record.sequence !== sequence || typeof record.update?.sessionUpdate !== "string") {
+			console.log(JSON.stringify({ error: { message: `bad record sequence ${record.sequence}, expected ${sequence}` } }));
+			process.exit(1);
+		}
+		if (record.update.sessionUpdate === "session_info_update") state.title = record.update.title;
+		state.log.push(record);
+		sequence += 1;
+	}
+	state.next = sequence;
+	save();
+	console.log(JSON.stringify({ operation: "appended", next_sequence: sequence }));
+	process.exit(0);
+}
+console.log(JSON.stringify({ error: { message: `unhandled ${args.join(" ")}` } }));
+process.exit(1);

@@ -1,0 +1,31 @@
+---
+name: Publish to npm
+
+# Publishes to npmjs.org when a release is published and NPM_TOKEN is set.
+# Create a granular automation token (it bypasses OTP) and add it with:
+#   gh secret set NPM_TOKEN
+"on":
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is unset; skipping npm publish"
+            exit 0
+          fi
+          npm publish --access public

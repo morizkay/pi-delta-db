@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-01
+
 ### Added
 
+- Durable outbox: records are fsynced under `~/.pi/agent/delta-db/outbox/` before Delta is
+  contacted, and a failed append is retried on the next message and the next session start.
+- Thoughts, tool calls, and tool results are recorded, not only message text.
+- `/delta off` and `/delta on` are remembered for the session.
+- Bindings whose session file is gone and that have not been touched for a week are pruned.
+- Tests for record shapes, sequence assignment, outbox retry, and pruning (`npm test`).
+- CI runs `npm run check` and `npm test` on every push.
+- npm publish workflow: a published release publishes to npmjs.org when `NPM_TOKEN` is set.
 - GitHub Packages mirror: `.github/workflows/publish-github-packages.yml` publishes
   `@morizkay/pi-delta-db` on every published release, populating the repository's Packages tab.
   npmjs.org (`pi-delta-db`) remains the installable channel.
@@ -38,5 +48,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `session_info_update` re-titled the thread on every continuation. The title is now written
   once and remembered in the session binding.
 
-[Unreleased]: https://github.com/morizkay/pi-delta-db/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/morizkay/pi-delta-db/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/morizkay/pi-delta-db/releases/tag/v0.2.0
 [0.1.0]: https://github.com/morizkay/pi-delta-db/releases/tag/v0.1.0
