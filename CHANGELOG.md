@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A retry resends the sequence numbers saved in the outbox. It no longer asks `thread status`
+  for a new number, which could store the same turn twice after a timeout.
+- A partial append drops only the receipt-confirmed prefix (`recorded`, `duplicate`, or `fenced`).
+- A non-retryable Delta error pauses recording instead of being retried as "unreachable".
+  `reload_required` tells you to Fork & Restore or `delta thread discard --force`. `/delta on` retries.
+- Pruning a week-old binding leaves it alone when its outbox still has unsent records.
+- `delta_read` search puts `--` before the query words so a leading dash is not a flag.
+
+### Added
+
+- A contract check against `delta thread contract`. This build speaks contract 8 and stops
+  recording outside that range.
+- A live turn is marked running, then idle, with one `turnSequence`. A thread watch stops the
+  Pi turn when Delta reports that turn superseded or a record comes back fenced.
+
+### Removed
+
+- `delta_db`. Delta's database is internal; reading it is not part of the plugin contract.
+
 ## [0.2.0] - 2026-11-01
 
 ### Added

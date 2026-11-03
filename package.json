@@ -1,7 +1,7 @@
 {
   "name": "pi-delta-db",
   "version": "0.2.0",
-  "description": "Pi extension that stores and reads Pi session data through the Delta CLI: auto-recorded Delta threads plus read-only inspection of Delta's local store",
+  "description": "Pi extension that records a Pi session to a private Delta thread and reads threads back through the Delta CLI",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",

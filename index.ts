@@ -1,16 +1,12 @@
 /**
- * pi-delta-db — store and read Pi data through the Delta CLI (`delta`).
+ * pi-delta-db — record a Pi session to a private Delta thread and read threads back.
  *
- * Delta's SQLite store (`delta db ...`) is internal and read-only from outside,
- * so writes go through Delta's supported path: a private thread bound to this
- * session (`--source pi --external-id <session>`) recorded with schema-1 JSONL.
- *
- * Records are staged to a local outbox before any network call. A failed append
- * stays on disk and is retried; resending is safe because each messageId is unique
- * and Delta replaces a record that reuses one.
+ * Writes go through `delta thread append` as schema-1 JSONL. Each record is numbered
+ * when it is staged, and a retry sends those same bytes. Delta then returns `duplicate`
+ * instead of storing a second copy.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -20,6 +16,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 
 const SOURCE = "pi";
+const PRODUCER = "Pi";
+/** Contract this build speaks. Delta 0.23.0 reports min 8, max 8. */
+export const CONTRACT = 8;
 const STATE_DIR = process.env.PI_DELTA_STATE || path.join(os.homedir(), ".pi", "agent", "delta-db");
 const SESSIONS_DIR = path.join(os.homedir(), ".pi", "agent", "sessions");
 const MAX_CHARS = 12_000;
@@ -34,8 +33,17 @@ export interface Update {
 	toolCallId?: string;
 	name?: string;
 	status?: string;
+	state?: string;
 	rawInput?: unknown;
 	rawOutput?: unknown;
+}
+
+/** One outbox line. `sequence` is assigned at stage time and never rewritten. */
+export interface StoredRecord {
+	schemaVersion: 1;
+	sequence: number;
+	turnSequence?: number;
+	update: Update;
 }
 
 interface Org {
@@ -59,13 +67,6 @@ interface ThreadShow {
 	transcript?: string;
 	buffer?: string;
 }
-interface Stats {
-	schema_version?: number;
-	node_count?: number;
-	node_compressed_bytes?: number;
-	node_types?: { type: string; count: number; compressed_bytes: number }[];
-	roots?: { id: string; type: string }[];
-}
 interface ContentBlock {
 	type?: string;
 	text?: string;
@@ -81,16 +82,68 @@ interface FinalMessage {
 	toolName?: string;
 	isError?: boolean;
 }
-/** A session's Delta thread binding. `titled` keeps a continued session from renaming it. */
 interface Binding {
 	threadId?: string;
 	titled?: boolean;
 	enabled?: boolean;
+	/** Next sequence to assign. Never moved backward, and never used to renumber the outbox. */
+	nextSequence?: number;
+	/** Set when Delta will not accept a retry. `/delta on` clears it. */
+	paused?: string;
+}
+interface DeltaRun {
+	stdout: string;
+	stderr: string;
+	code: number | null;
+}
+interface FlushResult {
+	count: number;
+	threadId?: string;
+	url?: string;
+	nextSequence?: number;
 }
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
-/** Parse CLI output at its boundary; unparseable text becomes undefined. */
+export class DeltaFailure extends Error {
+	readonly retryable: boolean;
+	readonly code?: string;
+	readonly retryAfterMs?: number;
+	readonly stdout: string;
+	fenced = false;
+	constructor(
+		message: string,
+		options: { retryable: boolean; code?: string; retryAfterMs?: number; stdout?: string },
+	) {
+		super(message);
+		this.name = "DeltaFailure";
+		this.retryable = options.retryable;
+		this.code = options.code;
+		this.retryAfterMs = options.retryAfterMs;
+		this.stdout = options.stdout ?? "";
+	}
+}
+
+/** `reload_required` is a published code, not the free-text reason. */
+export function explain(code: string | undefined, message: string): string {
+	if (code === "reload_required") {
+		return `${message} Open the thread in Delta and choose Fork & Restore, or run \`delta thread discard --force\`.`;
+	}
+	return message;
+}
+
+/** Stop recording when this build is outside the CLI's contract range. */
+export function contractProblem(min: number, max: number): string | undefined {
+	if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max)) {
+		return "Delta did not report a contract range. Update Delta.";
+	}
+	if (max < CONTRACT) return `Delta CLI is too old for this plugin (contract ${max}, need ${CONTRACT}). Update Delta.`;
+	if (min > CONTRACT) {
+		return `This plugin is too old for this Delta CLI (needs contract ${min}, plugin speaks ${CONTRACT}). Update pi-delta-db.`;
+	}
+	return undefined;
+}
+
 function parseJson(text: string): JsonValue | undefined {
 	if (!text.trim()) return undefined;
 	try {
@@ -100,45 +153,91 @@ function parseJson(text: string): JsonValue | undefined {
 	}
 }
 
-/** Run `delta`, returning stdout, and turn a failed exit into an Error. */
-function run(args: string[], input?: string): Promise<string> {
+function run(args: string[], input?: string): Promise<DeltaRun> {
 	return new Promise((resolve, reject) => {
 		const child = spawn("delta", args, { stdio: ["pipe", "pipe", "pipe"] });
-		let out = "";
-		let err = "";
+		let stdout = "";
+		let stderr = "";
 		const timer = setTimeout(() => child.kill("SIGKILL"), TIMEOUT_MS);
-		child.stdout.on("data", (chunk) => (out += chunk));
-		child.stderr.on("data", (chunk) => (err += chunk));
+		child.stdout.on("data", (chunk) => (stdout += chunk));
+		child.stderr.on("data", (chunk) => (stderr += chunk));
 		child.on("error", (error) => {
 			clearTimeout(timer);
-			reject(new Error(error.message.includes("ENOENT") ? "`delta` was not found on PATH" : error.message));
+			const missing = error.message.includes("ENOENT");
+			reject(
+				new DeltaFailure(missing ? "`delta` was not found on PATH" : error.message, {
+					retryable: false,
+					code: missing ? "not_found" : "spawn",
+				}),
+			);
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
-			if (code === 0) {
-				resolve(out);
-				return;
-			}
-			// With --json the CLI prints {error:{message}} on stdout; prefer that over stderr noise.
-			const reported = (parseJson(out) as { error?: { message?: string } } | undefined)?.error?.message;
-			reject(new Error(reported ?? err.trim() ?? `delta ${args.slice(0, 2).join(" ")} exited ${code}`));
+			resolve({ stdout, stderr, code });
 		});
 		child.stdin.end(input);
 	});
 }
 
+function errorEnvelope(stdout: string): { message?: string; code?: string; retryable?: boolean; retry_after_ms?: number } | undefined {
+	const lines = stdout.split("\n").filter((line) => line.trim());
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const value = parseJson(lines[i]) as { error?: { message?: string; code?: string; retryable?: boolean; retry_after_ms?: number } } | undefined;
+		if (value && typeof value === "object" && !Array.isArray(value) && value.error) return value.error;
+	}
+	return undefined;
+}
+
+function asFailure(args: string[], result: DeltaRun): DeltaFailure {
+	if (result.code === null) {
+		return new DeltaFailure(`delta ${args.slice(0, 2).join(" ")} timed out`, {
+			retryable: true,
+			code: "timeout",
+			stdout: result.stdout,
+		});
+	}
+	const error = errorEnvelope(result.stdout);
+	const message = error?.message ?? (result.stderr.trim() || `delta ${args.slice(0, 2).join(" ")} exited ${result.code}`);
+	return new DeltaFailure(explain(error?.code, message), {
+		retryable: error?.retryable === true,
+		code: error?.code,
+		retryAfterMs: error?.retry_after_ms,
+		stdout: result.stdout,
+	});
+}
+
 async function json<T>(args: string[], input?: string): Promise<T> {
-	const out = await run(args, input);
-	const value = parseJson(out);
-	if (value === undefined) throw new Error(`delta ${args.slice(0, 2).join(" ")} returned no JSON`);
+	const result = await run(args, input);
+	if (result.code !== 0) throw asFailure(args, result);
+	const value = parseJson(result.stdout);
+	if (value === undefined) {
+		throw new DeltaFailure(`delta ${args.slice(0, 2).join(" ")} returned no JSON`, { retryable: false });
+	}
 	return value as T;
+}
+
+let contractChecked = false;
+let contractBlock: string | undefined;
+
+async function ensureContract(): Promise<void> {
+	if (contractChecked) {
+		if (contractBlock) throw new DeltaFailure(contractBlock, { retryable: false, code: "contract" });
+		return;
+	}
+	contractChecked = true;
+	try {
+		const report = await json<{ min?: number; max?: number }>(["thread", "contract", "--json"]);
+		contractBlock = contractProblem(Number(report.min), Number(report.max));
+	} catch (error) {
+		contractBlock = `Could not read Delta's contract. ${(error as Error).message}`;
+	}
+	if (contractBlock) throw new DeltaFailure(contractBlock, { retryable: false, code: "contract" });
 }
 
 function clip(text: string, limit = MAX_CHARS): string {
 	return text.length > limit ? `${text.slice(0, limit)}\n…truncated (${text.length} chars)` : text;
 }
 
-/** A stable producer key for this Pi session; also the on-disk binding name. */
 function sessionKey(ctx: ExtensionContext): string {
 	const raw = ctx.sessionManager.getSessionId() || ctx.sessionManager.getSessionFile() || `cwd-${ctx.cwd}`;
 	const tail = String(raw).split(/[\\/]/).pop() ?? "session";
@@ -158,24 +257,25 @@ function readBinding(key: string): Binding | undefined {
 		const saved = parseJson(fs.readFileSync(bindingFile(key), "utf8")) as Binding | undefined;
 		return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : undefined;
 	} catch {
-		// No binding file yet: this session has never written to Delta.
 		return undefined;
 	}
 }
 
 function writeBinding(key: string, binding: Binding): void {
 	fs.mkdirSync(STATE_DIR, { recursive: true });
-	fs.writeFileSync(bindingFile(key), JSON.stringify(binding, null, 2));
+	const saved = { ...binding };
+	if (!saved.paused) delete saved.paused;
+	fs.writeFileSync(bindingFile(key), JSON.stringify(saved, null, 2));
 }
 
-/** `PI_DELTA_RECORD=0` forces off for this process; `/delta off` persists in the binding. */
 export function recordingEnabled(key: string): boolean {
 	if (process.env.PI_DELTA_RECORD === "0") return false;
 	return readBinding(key)?.enabled !== false;
 }
 
 export function setRecording(key: string, enabled: boolean): void {
-	writeBinding(key, { ...readBinding(key), enabled });
+	const binding = readBinding(key) ?? {};
+	writeBinding(key, enabled ? { ...binding, enabled, paused: undefined } : { ...binding, enabled });
 }
 
 async function ensureThread(key: string): Promise<Binding> {
@@ -183,7 +283,7 @@ async function ensureThread(key: string): Promise<Binding> {
 	if (bound?.threadId) return bound;
 	const { organizations } = await json<{ organizations?: Org[] }>(["org", "list", "--json"]);
 	const org = organizations?.find((item) => item.current) ?? organizations?.[0];
-	if (!org) throw new Error("No Delta organization. Run `delta auth login`, then retry.");
+	if (!org) throw new DeltaFailure("No Delta organization. Run `delta auth login`, then retry.", { retryable: false });
 	const created = await json<{ thread_id: string }>([
 		"thread",
 		"create",
@@ -197,7 +297,7 @@ async function ensureThread(key: string): Promise<Binding> {
 		org.id,
 		"--json",
 	]);
-	const binding: Binding = { ...bound, threadId: created.thread_id };
+	const binding: Binding = { ...readBinding(key), threadId: created.thread_id };
 	writeBinding(key, binding);
 	return binding;
 }
@@ -206,24 +306,47 @@ function statusOf(key: string, threadId: string): Promise<ThreadStatus> {
 	return json<ThreadStatus>(["thread", "status", "--source", SOURCE, "--external-id", key, "--json", threadId]);
 }
 
-/** Schema-1 JSONL continuing at `first`. Exported so tests can lock the envelope. */
-export function assignSequences(first: number, updates: Update[]): string {
-	return updates
-		.map((update, index) => JSON.stringify({ schemaVersion: 1, sequence: first + index, update }))
-		.join("\n");
+function recordFor(sequence: number, update: Update, turnSequence?: number): StoredRecord {
+	const record: StoredRecord = { schemaVersion: 1, sequence, update };
+	const turn = update.sessionUpdate === "state_update" && update.state === "running" ? sequence : turnSequence;
+	if (turn !== undefined) record.turnSequence = turn;
+	return record;
 }
 
-/** Append schema-1 records, continuing this producer's sequence. */
-async function append(key: string, threadId: string, updates: Update[]) {
-	const status = await statusOf(key, threadId);
-	const first = status.producer?.next_sequence;
-	if (first === undefined || !Number.isSafeInteger(first))
-		throw new Error("Delta did not report the next sequence for this thread");
-	await run(
-		["thread", "append", "--source", SOURCE, "--external-id", key, "--acknowledge", "local", "--json", threadId],
-		`${assignSequences(first, updates)}\n`,
-	);
-	return { count: updates.length, nextSequence: first + updates.length, url: status.url };
+/** Schema-1 JSONL continuing at `first`. Exported so tests can lock the envelope. */
+export function assignSequences(first: number, updates: Update[], turnSequence?: number): string {
+	return updates.map((update, index) => JSON.stringify(recordFor(first + index, update, turnSequence))).join("\n");
+}
+
+/**
+ * How many leading receipts Delta confirmed. `recorded`, `duplicate`, and `fenced`
+ * are confirmed; anything else stops the prefix so the tail keeps its sequence numbers.
+ */
+export function confirmedPrefix(
+	stdout: string,
+	threadId: string,
+	records: StoredRecord[],
+): { count: number; fenced: boolean } {
+	let count = 0;
+	let fenced = false;
+	for (const line of stdout.split("\n")) {
+		if (!line.trim() || count >= records.length) break;
+		const receipt = parseJson(line) as { operation?: string; thread_id?: string; sequence?: number; disposition?: string } | undefined;
+		const expected = records[count];
+		const disposition = receipt?.disposition;
+		if (
+			!receipt ||
+			receipt.operation !== "appended" ||
+			receipt.thread_id !== threadId ||
+			receipt.sequence !== expected.sequence ||
+			(disposition !== "recorded" && disposition !== "duplicate" && disposition !== "fenced")
+		) {
+			break;
+		}
+		if (disposition === "fenced") fenced = true;
+		count += 1;
+	}
+	return { count, fenced };
 }
 
 function textOf(content: string | ContentBlock[] | undefined): string {
@@ -244,10 +367,6 @@ function textUpdate(role: string | undefined, id: string, text: string): Update 
 	};
 }
 
-/**
- * Turn one finalized Pi message into Delta records.
- * `id` must be unique per message: Delta replaces a record that reuses a messageId.
- */
 export function updatesFromMessage(message: FinalMessage, id: string): Update[] {
 	const updates: Update[] = [];
 	if (message.role === "toolResult" && message.toolCallId) {
@@ -304,49 +423,179 @@ function firstLine(text: string): string {
 	return line.trim().slice(0, 60);
 }
 
-/** Append records to the outbox and fsync. A crash after this still retries. */
-export function stageUpdates(key: string, updates: Update[]): void {
-	if (!updates.length) return;
-	const file = outboxFile(key);
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	const fd = fs.openSync(file, "a");
+function corrupt(key: string): DeltaFailure {
+	return new DeltaFailure(`corrupt outbox record for ${key}; sharing paused without dropping it`, {
+		retryable: false,
+		code: "corrupt",
+	});
+}
+
+function readOutbox(key: string): { records: StoredRecord[]; legacy: Update[] } {
+	let text: string;
 	try {
-		fs.writeSync(fd, `${updates.map((update) => JSON.stringify(update)).join("\n")}\n`);
+		text = fs.readFileSync(outboxFile(key), "utf8");
+	} catch {
+		return { records: [], legacy: [] };
+	}
+	if (!text.trim()) return { records: [], legacy: [] };
+	const records: StoredRecord[] = [];
+	const legacy: Update[] = [];
+	for (const line of text.split("\n")) {
+		if (!line) continue;
+		const value = parseJson(line);
+		if (!value || typeof value !== "object" || Array.isArray(value)) throw corrupt(key);
+		const row = value as unknown as StoredRecord & Update;
+		if (row.schemaVersion === 1 && Number.isSafeInteger(row.sequence) && typeof row.update?.sessionUpdate === "string") {
+			records.push({
+				schemaVersion: 1,
+				sequence: row.sequence,
+				...(row.turnSequence !== undefined ? { turnSequence: row.turnSequence } : {}),
+				update: row.update,
+			});
+			continue;
+		}
+		if (typeof row.sessionUpdate === "string" && row.schemaVersion === undefined) {
+			legacy.push(row);
+			continue;
+		}
+		throw corrupt(key);
+	}
+	if (records.length && legacy.length) throw corrupt(key);
+	return { records, legacy };
+}
+
+function rewriteOutbox(key: string, records: StoredRecord[]): void {
+	const file = outboxFile(key);
+	if (!records.length) {
+		fs.rmSync(file, { force: true });
+		return;
+	}
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const fd = fs.openSync(file, "w");
+	try {
+		fs.writeSync(fd, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
 		fs.fsyncSync(fd);
 	} finally {
 		fs.closeSync(fd);
 	}
 }
 
-export function pendingUpdates(key: string): Update[] {
-	let text: string;
-	try {
-		text = fs.readFileSync(outboxFile(key), "utf8");
-	} catch {
-		return [];
-	}
-	if (!text.trim()) return [];
-	return text
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => {
-			try {
-				return JSON.parse(line) as Update;
-			} catch {
-				throw new Error(`corrupt outbox record for ${key}; sharing paused without dropping it`);
-			}
-		});
+function allocate(key: string, count: number): number {
+	const binding = readBinding(key) ?? {};
+	const first = binding.nextSequence ?? 1;
+	writeBinding(key, { ...binding, nextSequence: first + count });
+	return first;
 }
 
-/** Send the outbox, then drop it. On failure the file stays for the next attempt. */
-export async function flushPending(key: string): Promise<{ count: number; threadId?: string; url?: string; nextSequence?: number }> {
-	const updates = pendingUpdates(key);
-	if (!updates.length) return { count: 0 };
-	const binding = await ensureThread(key);
-	if (!binding.threadId) throw new Error("Delta thread was not created");
-	const result = await append(key, binding.threadId, updates);
-	fs.rmSync(outboxFile(key), { force: true });
-	return { count: result.count, threadId: binding.threadId, url: result.url, nextSequence: result.nextSequence };
+/** Append numbered records to the outbox and fsync. Returns the first sequence. */
+export function stageUpdates(key: string, updates: Update[], turnSequence?: number): number {
+	if (!updates.length) return 0;
+	const first = allocate(key, updates.length);
+	const records = updates.map((update, index) => recordFor(first + index, update, turnSequence));
+	const file = outboxFile(key);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const fd = fs.openSync(file, "a");
+	try {
+		fs.writeSync(fd, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+		fs.fsyncSync(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
+	return first;
+}
+
+export function pendingUpdates(key: string): StoredRecord[] {
+	const loaded = readOutbox(key);
+	if (!loaded.legacy.length) return loaded.records;
+	const first = readBinding(key)?.nextSequence ?? 1;
+	return loaded.legacy.map((update, index) => recordFor(first + index, update));
+}
+
+/** Number a pre-0.3 outbox once. Later retries resend this file, they do not ask status again. */
+async function sealLegacy(key: string, updates: Update[]): Promise<StoredRecord[]> {
+	const binding = readBinding(key) ?? {};
+	let first = binding.nextSequence;
+	if (first === undefined && binding.threadId) {
+		const remote = (await statusOf(key, binding.threadId)).producer?.next_sequence;
+		if (remote === undefined || !Number.isSafeInteger(remote)) {
+			throw new DeltaFailure("Delta did not report the next sequence for this thread", { retryable: false, code: "sequence" });
+		}
+		first = remote;
+	}
+	first ??= 1;
+	const records = updates.map((update, index) => recordFor(first + index, update));
+	rewriteOutbox(key, records);
+	writeBinding(key, { ...readBinding(key), nextSequence: first + updates.length });
+	return records;
+}
+
+const retryAt = new Map<string, number>();
+
+async function append(key: string, threadId: string, records: StoredRecord[]) {
+	const args = ["thread", "append", "--source", SOURCE, "--external-id", key, "--acknowledge", "local", "--json", threadId];
+	const result = await run(args, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+	const prefix = confirmedPrefix(result.stdout, threadId, records);
+	if (result.code !== 0) return { ...prefix, failure: asFailure(args, result) };
+	if (prefix.count < records.length) {
+		return {
+			...prefix,
+			failure: new DeltaFailure("Delta confirmed only part of the batch", { retryable: true, code: "short_read", stdout: result.stdout }),
+		};
+	}
+	return { ...prefix, failure: undefined as DeltaFailure | undefined };
+}
+
+/** Send the outbox. Drops only the receipt-confirmed prefix; the tail keeps its sequence numbers. */
+export async function flushPending(key: string): Promise<FlushResult> {
+	try {
+		return await flushInner(key);
+	} catch (error) {
+		if (error instanceof DeltaFailure && !error.retryable && error.code !== "paused" && error.code !== "contract") {
+			writeBinding(key, { ...readBinding(key), paused: error.message });
+		}
+		throw error;
+	}
+}
+
+async function flushInner(key: string): Promise<FlushResult> {
+	await ensureContract();
+	const binding = readBinding(key);
+	if (binding?.paused) throw new DeltaFailure(binding.paused, { retryable: false, code: "paused" });
+	const wait = retryAt.get(key) ?? 0;
+	if (Date.now() < wait) {
+		throw new DeltaFailure("Delta asked to retry later", { retryable: true, code: "retry_after", retryAfterMs: wait - Date.now() });
+	}
+	const loaded = readOutbox(key);
+	const records = loaded.legacy.length ? await sealLegacy(key, loaded.legacy) : loaded.records;
+	if (!records.length) return { count: 0 };
+	const bound = await ensureThread(key);
+	if (!bound.threadId) throw new DeltaFailure("Delta thread was not created", { retryable: false });
+	const result = await append(key, bound.threadId, records);
+	if (result.count) rewriteOutbox(key, records.slice(result.count));
+	if (result.fenced) {
+		const failure = result.failure ?? new DeltaFailure("This turn was taken over in Delta.", { retryable: true, code: "fenced" });
+		failure.fenced = true;
+		throw failure;
+	}
+	if (result.failure) {
+		if (result.failure.retryable && result.failure.retryAfterMs) {
+			retryAt.set(key, Date.now() + result.failure.retryAfterMs);
+		}
+		throw result.failure;
+	}
+	retryAt.delete(key);
+	let url: string | undefined;
+	try {
+		url = (await statusOf(key, bound.threadId)).url;
+	} catch {
+		// The records are already confirmed. The URL is only for the tool reply.
+	}
+	return {
+		count: result.count,
+		threadId: bound.threadId,
+		url,
+		nextSequence: readBinding(key)?.nextSequence ?? records.at(-1)!.sequence + 1,
+	};
 }
 
 function sessionFileExists(sessionsDir: string, key: string): boolean {
@@ -368,7 +617,15 @@ function sessionFileExists(sessionsDir: string, key: string): boolean {
 	return false;
 }
 
-/** Drop bindings whose session file is gone and that have not been touched for a week. */
+function outboxPending(key: string): boolean {
+	try {
+		return fs.statSync(outboxFile(key)).size > 0;
+	} catch {
+		return false;
+	}
+}
+
+/** Drop old bindings whose session file is gone. A non-empty outbox is unsent work, so it stays. */
 export function pruneBindings(currentKey: string, sessionsDir: string, now = Date.now()): string[] {
 	if (!fs.existsSync(sessionsDir) || !fs.existsSync(STATE_DIR)) return [];
 	let names: string[];
@@ -385,6 +642,7 @@ export function pruneBindings(currentKey: string, sessionsDir: string, now = Dat
 		const file = path.join(STATE_DIR, name);
 		if (now - fs.statSync(file).mtimeMs < PRUNE_AFTER_MS) continue;
 		if (sessionFileExists(sessionsDir, key)) continue;
+		if (outboxPending(key)) continue;
 		fs.rmSync(file, { force: true });
 		fs.rmSync(outboxFile(key), { force: true });
 		removed.push(key);
@@ -403,8 +661,7 @@ function summarizeList(threads: ThreadListItem[]): string {
 		.join("\n");
 }
 
-/** Stage a message, including the thread title the first time a user prompt arrives. */
-function stageMessage(key: string, message: FinalMessage, id: string): number {
+function stageMessage(key: string, message: FinalMessage, id: string, turnSequence?: number): number {
 	const updates = updatesFromMessage(message, id);
 	if (!updates.length) return 0;
 	const binding = readBinding(key);
@@ -415,13 +672,11 @@ function stageMessage(key: string, message: FinalMessage, id: string): number {
 			writeBinding(key, { ...binding, titled: true });
 		}
 	}
-	stageUpdates(key, updates);
+	stageUpdates(key, updates, turnSequence);
 	return updates.length;
 }
 
 export default function (pi: ExtensionAPI) {
-	// One writer at a time: sequence numbers come from `thread status`, so overlapping
-	// appends would reuse a sequence and Delta would reject them.
 	let queue: Promise<unknown> = Promise.resolve();
 	function enqueue<T>(task: () => Promise<T>): Promise<T> {
 		const queued = queue.then(task, task);
@@ -430,49 +685,127 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	let rec: { key: string; enabled: boolean; warned: boolean } | null = null;
+	let watchChild: ChildProcess | null = null;
+	let watchTimer: ReturnType<typeof setTimeout> | undefined;
+	let watchFailures = 0;
+	let shuttingDown = false;
+	let openTurn: { key: string; turnSequence: number } | null = null;
+
 	const sessionOf = (ctx: ExtensionContext) =>
 		(rec ??= { key: sessionKey(ctx), enabled: recordingEnabled(sessionKey(ctx)), warned: false });
 
-	async function record(key: string, message: FinalMessage, id: string): Promise<void> {
-		stageMessage(key, message, id);
-		await flushPending(key);
+	function stopTurn(ctx: ExtensionContext): void {
+		ctx.abort();
+		ctx.ui.notify("Delta turn was taken over; stopped this turn.", "warning");
+	}
+
+	function handleError(error: unknown, ctx: ExtensionContext, current: { warned: boolean }): void {
+		if (error instanceof DeltaFailure && error.fenced) {
+			stopTurn(ctx);
+			return;
+		}
+		if (current.warned) return;
+		current.warned = true;
+		if (error instanceof DeltaFailure && !error.retryable) {
+			ctx.ui.notify(`Delta recording paused. ${error.message} Run /delta on after fixing it.`, "error");
+			return;
+		}
+		ctx.ui.notify(`Delta unreachable; queued records will retry. ${(error as Error).message}`, "warning");
+	}
+
+	function startWatch(key: string, threadId: string, ctx: ExtensionContext): void {
+		if (watchChild || shuttingDown || contractBlock) return;
+		// Watch is already JSONL. `--json` makes Delta print one result and disconnect.
+		const child = spawn(
+			"delta",
+			["thread", "watch", threadId, "--source", SOURCE, "--external-id", key, "--participate", PRODUCER],
+			{ stdio: ["ignore", "pipe", "pipe"] },
+		);
+		watchChild = child;
+		let buf = "";
+		child.stdout?.on("data", (chunk: Buffer) => {
+			watchFailures = 0;
+			buf += chunk.toString();
+			let nl = buf.indexOf("\n");
+			while (nl >= 0) {
+				const event = parseJson(buf.slice(0, nl)) as { type?: string; status?: string } | undefined;
+				buf = buf.slice(nl + 1);
+				if (event?.type === "producer.turn" && event.status === "superseded") stopTurn(ctx);
+				nl = buf.indexOf("\n");
+			}
+		});
+		child.on("error", () => {});
+		child.on("close", () => {
+			if (watchChild === child) watchChild = null;
+			if (shuttingDown) return;
+			watchFailures += 1;
+			if (watchFailures > 3) {
+				ctx.ui.notify("Delta watch stopped; a takeover in the app will not stop this turn until restart.", "warning");
+				return;
+			}
+			watchTimer = setTimeout(() => startWatch(key, threadId, ctx), 2000);
+		});
+	}
+
+	async function flushAndWatch(key: string, ctx: ExtensionContext): Promise<void> {
+		const flushed = await flushPending(key);
+		const threadId = flushed.threadId ?? readBinding(key)?.threadId;
+		if (threadId) startWatch(key, threadId, ctx);
 	}
 
 	pi.on("session_start", (_event, ctx) => {
 		const key = sessionKey(ctx);
 		rec = { key, enabled: recordingEnabled(key), warned: false };
 		pruneBindings(key, SESSIONS_DIR);
-		enqueue(() => flushPending(key)).catch((error: Error) => {
-			if (rec?.warned) return;
-			if (rec) rec.warned = true;
-			ctx.ui.notify(`Delta unreachable; queued records will retry. ${error.message}`, "warning");
+		enqueue(() => flushAndWatch(key, ctx)).catch((error: unknown) => {
+			if (rec) handleError(error, ctx, rec);
 		});
+	});
+
+	pi.on("turn_start", (_event, ctx) => {
+		const current = sessionOf(ctx);
+		if (!current.enabled || contractBlock || readBinding(current.key)?.paused) return;
+		const sequence = stageUpdates(current.key, [{ sessionUpdate: "state_update", state: "running" }]);
+		openTurn = { key: current.key, turnSequence: sequence };
+		enqueue(() => flushAndWatch(current.key, ctx)).catch((error: unknown) => handleError(error, ctx, current));
+	});
+
+	pi.on("turn_end", (_event, ctx) => {
+		const current = sessionOf(ctx);
+		const turn = openTurn;
+		openTurn = null;
+		if (!turn || turn.key !== current.key) return;
+		enqueue(async () => {
+			stageUpdates(current.key, [{ sessionUpdate: "state_update", state: "idle" }], turn.turnSequence);
+			await flushAndWatch(current.key, ctx);
+		}).catch((error: unknown) => handleError(error, ctx, current));
 	});
 
 	pi.on("message_end", (event, ctx) => {
 		const current = sessionOf(ctx);
-		if (!current.enabled) return;
+		if (!current.enabled || contractBlock) return;
 		const message = event.message as FinalMessage;
 		if (message?.role !== "user" && message?.role !== "assistant" && message?.role !== "toolResult") return;
 		const id = randomUUID();
+		const turnSequence = openTurn?.key === current.key ? openTurn.turnSequence : undefined;
 		enqueue(async () => {
 			try {
-				await record(current.key, message, id);
+				stageMessage(current.key, message, id, turnSequence);
+				await flushAndWatch(current.key, ctx);
 				if (current.warned) {
 					current.warned = false;
 					ctx.ui.notify("Delta recording resumed", "info");
 				}
 			} catch (error) {
-				if (current.warned) return;
-				current.warned = true;
-				ctx.ui.notify(`Delta unreachable; this turn is queued and will retry. ${(error as Error).message}`, "warning");
+				handleError(error, ctx, current);
 			}
 		});
 	});
 
 	pi.on("session_shutdown", async () => {
-		// Let the tail of the queue reach Delta before the process exits. What doesn't
-		// make it stays in the outbox for the next start.
+		shuttingDown = true;
+		if (watchTimer) clearTimeout(watchTimer);
+		watchChild?.kill("SIGTERM");
 		await Promise.race([queue, new Promise((resolve) => setTimeout(resolve, 8000))]);
 	});
 
@@ -483,9 +816,7 @@ export default function (pi: ExtensionAPI) {
 			"Store text in this session's private Delta thread. Creates the thread on first use and appends a recorded message that the Delta app can open and share.",
 		parameters: Type.Object({
 			text: Type.String({ description: "Text to store" }),
-			role: Type.Optional(
-				StringEnum(["assistant", "user"] as const, { description: "Message author (default assistant)" }),
-			),
+			role: Type.Optional(StringEnum(["assistant", "user"] as const, { description: "Message author (default assistant)" })),
 			title: Type.Optional(Type.String({ description: "Set the thread title when given" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -499,8 +830,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				updates.push(textUpdate(params.role, `${key}:${randomUUID()}`, params.text));
 				stageUpdates(key, updates);
-				const flushed = await flushPending(key);
-				return { ...flushed, threadId: flushed.threadId };
+				return flushPending(key);
 			});
 			const where = result.url ? ` ${result.url}` : "";
 			return {
@@ -536,7 +866,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "search") {
 				if (!params.query?.trim()) throw new Error("query is required for search");
 				const words = params.query.trim().split(/\s+/);
-				const threads = await json<ThreadListItem[]>(["thread", "search", "-n", "20", "--json", ...words]);
+				const threads = await json<ThreadListItem[]>(["thread", "search", "-n", "20", "--json", "--", ...words]);
 				return {
 					content: [{ type: "text", text: summarizeList(threads) }],
 					details: { action: "search", query: params.query, count: threads.length },
@@ -554,43 +884,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "delta_db",
-		label: "Delta DB",
-		description:
-			"Inspect Delta's local SQLite store (read-only): storage stats, or decode one stored root by id. Actions: stats, root (needs id).",
-		parameters: Type.Object({
-			action: StringEnum(["stats", "root"] as const),
-			id: Type.Optional(Type.String({ description: "Root id from stats, for root" })),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate) {
-			if (params.action === "stats") {
-				const stats = await json<Stats>(["db", "stats", "--json"]);
-				const types = (stats.node_types ?? [])
-					.map((item) => `${item.type}: ${item.count} nodes, ${item.compressed_bytes} B`)
-					.join("\n");
-				const roots = (stats.roots ?? []).map((item) => `${item.id} ${item.type}`).join("\n");
-				return {
-					content: [
-						{
-							type: "text",
-							text: clip(
-								`schema ${stats.schema_version}, ${stats.node_count} nodes, ${stats.node_compressed_bytes} B\n${types}\n\nroots:\n${roots}`,
-							),
-						},
-					],
-					details: { action: "stats", schemaVersion: stats.schema_version, nodes: stats.node_count },
-				};
-			}
-			if (!params.id) throw new Error("id is required for root");
-			const decoded = await json<{ type?: string }>(["db", "root", params.id, "--json"]);
-			return {
-				content: [{ type: "text", text: clip(JSON.stringify(decoded, null, 2)) }],
-				details: { action: "root", id: params.id, type: decoded?.type },
-			};
-		},
-	});
-
 	pi.registerCommand("delta", {
 		description: "Show or toggle this session's Delta recording",
 		handler: async (args, ctx) => {
@@ -599,6 +892,10 @@ export default function (pi: ExtensionAPI) {
 			if (arg === "on" || arg === "off") {
 				current.enabled = arg === "on";
 				setRecording(current.key, current.enabled);
+				if (current.enabled) {
+					current.warned = false;
+					enqueue(() => flushAndWatch(current.key, ctx)).catch((error: unknown) => handleError(error, ctx, current));
+				}
 				ctx.ui.notify(`Delta recording ${arg}`, "info");
 				return;
 			}
@@ -609,7 +906,9 @@ export default function (pi: ExtensionAPI) {
 				binding?.threadId ? `Thread: ${binding.threadId}` : "Thread: none yet",
 				queued ? `Queued: ${queued}` : "Queued: 0",
 			];
-			if (binding?.threadId) {
+			if (contractBlock) lines.push(contractBlock);
+			if (binding?.paused) lines.push(`Paused: ${binding.paused}`);
+			if (binding?.threadId && !binding.paused) {
 				const status = await statusOf(current.key, binding.threadId);
 				if (status.title) lines.push(`Title: ${status.title}`);
 				if (status.url) lines.push(status.url);

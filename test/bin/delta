@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-// Fake `delta` for tests. State lives in PI_FAKE_DELTA_DIR. Append fails while PI_FAKE_DELTA_FAIL=1.
+// Fake `delta` for tests. State lives in PI_FAKE_DELTA_DIR.
+// PI_FAKE_DELTA_FAIL=1: append exits retryable before writing.
+// PI_FAKE_DELTA_PARTIAL=1: records the first line, then exits retryable.
+// PI_FAKE_DELTA_PERMANENT=1: append exits non-retryable before writing.
 import fs from "node:fs";
 import path from "node:path";
 
@@ -11,17 +14,42 @@ if (!dir) {
 const file = path.join(dir, "state.json");
 const state = fs.existsSync(file)
 	? JSON.parse(fs.readFileSync(file, "utf8"))
-	: { next: 1, threadId: "thread_test", log: [] };
+	: { threadId: "thread_test", log: [], producers: {}, appends: 0 };
+state.producers ??= {};
+state.appends ??= 0;
 const save = () => fs.writeFileSync(file, JSON.stringify(state));
 
 const args = process.argv.slice(2);
 const sub = args[1];
-if (process.env.PI_FAKE_DELTA_FAIL === "1" && sub === "append") {
-	console.log(JSON.stringify({ error: { message: "fake down" } }));
+const externalId = () => {
+	const index = args.indexOf("--external-id");
+	return index >= 0 ? args[index + 1] : "default";
+};
+const producer = () => (state.producers[externalId()] ??= { next: 1 });
+
+function fail(message, extra = {}) {
+	console.log(JSON.stringify({ error: { message, ...extra } }));
 	process.exit(1);
 }
+function receipt(record, next, disposition) {
+	return {
+		operation: "appended",
+		thread_id: state.threadId,
+		sequence: record.sequence,
+		next_sequence: next,
+		duplicate: disposition === "duplicate",
+		version: "8",
+		disposition,
+		turn_sequence: record.turnSequence ?? null,
+	};
+}
+
 if (args[0] === "org" && sub === "list") {
 	console.log(JSON.stringify({ organizations: [{ id: "org_test", current: true }] }));
+	process.exit(0);
+}
+if (args[0] === "thread" && sub === "contract") {
+	console.log(JSON.stringify({ min: 8, max: 8 }));
 	process.exit(0);
 }
 if (args[0] === "thread" && sub === "create") {
@@ -30,25 +58,36 @@ if (args[0] === "thread" && sub === "create") {
 	process.exit(0);
 }
 if (args[0] === "thread" && sub === "status") {
-	console.log(JSON.stringify({ producer: { next_sequence: state.next }, url: "https://delta.example/t", title: state.title ?? null }));
+	console.log(JSON.stringify({ producer: { next_sequence: producer().next }, url: "https://delta.example/t", title: state.title ?? null }));
 	process.exit(0);
 }
 if (args[0] === "thread" && sub === "append") {
-	const lines = fs.readFileSync(0, "utf8").split("\n").filter(Boolean);
-	let sequence = state.next;
-	for (const line of lines) {
-		const record = JSON.parse(line);
-		if (record.schemaVersion !== 1 || record.sequence !== sequence || typeof record.update?.sessionUpdate !== "string") {
-			console.log(JSON.stringify({ error: { message: `bad record sequence ${record.sequence}, expected ${sequence}` } }));
-			process.exit(1);
+	state.appends += 1;
+	save();
+	if (process.env.PI_FAKE_DELTA_PERMANENT === "1") fail("reload the thread", { code: "reload_required", retryable: false });
+	if (process.env.PI_FAKE_DELTA_FAIL === "1") fail("fake down", { retryable: true });
+	const records = fs.readFileSync(0, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+	const limit = process.env.PI_FAKE_DELTA_PARTIAL === "1" ? 1 : records.length;
+	const cursor = producer();
+	for (let i = 0; i < records.length && i < limit; i++) {
+		const record = records[i];
+		if (record.schemaVersion !== 1 || typeof record.update?.sessionUpdate !== "string") {
+			fail(`bad record sequence ${record.sequence}`, { code: "invalid_record", retryable: false });
+		}
+		if (record.sequence < cursor.next) {
+			console.log(JSON.stringify(receipt(record, cursor.next, "duplicate")));
+			continue;
+		}
+		if (record.sequence !== cursor.next) {
+			fail(`bad record sequence ${record.sequence}, expected ${cursor.next}`, { code: "sequence_gap", retryable: false });
 		}
 		if (record.update.sessionUpdate === "session_info_update") state.title = record.update.title;
 		state.log.push(record);
-		sequence += 1;
+		cursor.next += 1;
+		save();
+		console.log(JSON.stringify(receipt(record, cursor.next, "recorded")));
 	}
-	state.next = sequence;
-	save();
-	console.log(JSON.stringify({ operation: "appended", next_sequence: sequence }));
+	if (limit < records.length) fail("partial", { retryable: true });
 	process.exit(0);
 }
 console.log(JSON.stringify({ error: { message: `unhandled ${args.join(" ")}` } }));

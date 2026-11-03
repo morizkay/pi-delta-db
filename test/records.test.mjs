@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assignSequences, updatesFromMessage } from "../index.ts";
+import { assignSequences, confirmedPrefix, contractProblem, updatesFromMessage } from "../index.ts";
 
 test("user and assistant text become unique message records", () => {
 	const user = updatesFromMessage({ role: "user", content: "hello" }, "m1");
@@ -53,4 +53,25 @@ test("sequences continue from the producer's next sequence", () => {
 	);
 	assert.equal(lines[0].schemaVersion, 1);
 	assert.equal(lines[1].update.sessionUpdate, "agent_message");
+});
+
+test("only a matching receipt prefix is confirmed, and a fenced receipt counts", () => {
+	const records = [
+		{ schemaVersion: 1, sequence: 4, update: { sessionUpdate: "user_message" } },
+		{ schemaVersion: 1, sequence: 5, update: { sessionUpdate: "agent_message" } },
+	];
+	const receipt = (sequence, disposition) =>
+		JSON.stringify({ operation: "appended", thread_id: "t", sequence, disposition });
+	assert.deepEqual(confirmedPrefix(`${receipt(4, "recorded")}\n${receipt(5, "duplicate")}\n`, "t", records), {
+		count: 2,
+		fenced: false,
+	});
+	assert.deepEqual(confirmedPrefix(`${receipt(4, "fenced")}\nnot-json\n`, "t", records), { count: 1, fenced: true });
+	assert.deepEqual(confirmedPrefix(`${receipt(9, "recorded")}\n`, "t", records), { count: 0, fenced: false });
+});
+
+test("contract 8 is the only range this build records", () => {
+	assert.equal(contractProblem(8, 8), undefined);
+	assert.match(contractProblem(8, 7), /Update Delta/);
+	assert.match(contractProblem(9, 9), /Update pi-delta-db/);
 });

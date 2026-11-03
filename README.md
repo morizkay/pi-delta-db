@@ -5,10 +5,11 @@
 
 Pi extension that lets Pi store and read data through the [Delta](https://delta.dev) CLI (`delta`).
 
-Delta's SQLite store behind `delta db` is internal and read-only from outside, so writes go
-through Delta's supported path: a private Delta thread bound to the Pi session, recorded with
-schema-1 JSONL (`delta thread create` + `delta thread append`). Everything Pi stores shows up
-in the Delta app and can be read back with or without Pi.
+Writes go through Delta's supported path: a private thread bound to the Pi session, recorded
+with schema-1 JSONL (`delta thread create` + `delta thread append`). Everything Pi stores shows
+up in the Delta app and can be read back with or without Pi. This is a recording plugin, not a
+full join: it does not mount the thread's files, pull teammate messages into Pi, or run
+subagents as child threads.
 
 ## Auto-recording
 
@@ -16,10 +17,12 @@ Every finalized user message, assistant message, thought, tool call, and tool re
 appended to this session's Delta thread, in order. The thread is created on the first message
 and titled with the first prompt; continuing a session (`pi -c`) keeps appending to the same thread.
 
-Records are written to `~/.pi/agent/delta-db/outbox/` and fsynced before Delta is contacted.
-If Delta is closed, offline, or rejects the write, the turn stays queued and is retried on the
-next message and the next session start. A retry cannot duplicate or erase earlier turns:
-each message id is unique, and Delta replaces a record that reuses one.
+Records are numbered when they are written to `~/.pi/agent/delta-db/outbox/` and fsynced
+before Delta is contacted. A retry sends those same bytes, so Delta returns `duplicate` instead
+of storing a second copy. Only the receipt-confirmed prefix is deleted. A retryable error waits
+until `retry_after_ms`, then tries again. A non-retryable error pauses recording until `/delta on`.
+While a turn is running, a `state_update` marks it running and then idle, and a thread watch
+stops the Pi turn if Delta reports that turn superseded.
 
 | Control | Effect |
 | --- | --- |
@@ -28,7 +31,7 @@ each message id is unique, and Delta replaces a record that reuses one.
 | `PI_DELTA_RECORD=0` | Start Pi with recording off for this process |
 
 Bindings whose Pi session file is gone and that have not been touched for a week are deleted
-on session start.
+on session start. A binding with an unsent outbox is kept.
 
 ## Tools
 
@@ -36,7 +39,6 @@ on session start.
 | --- | --- |
 | `delta_store` | Append text to this session's thread with an explicit `title`/`role`. |
 | `delta_read` | `list` threads, `search` by keywords, or `show` one transcript. |
-| `delta_db` | Read-only storage inspection: `stats` (schema version, node/root counts) or `root <id>`. |
 
 ## How it binds
 
@@ -45,9 +47,9 @@ One thread per Pi session:
 - Producer: `--source pi --external-id <pi-session-id>`
 - Created with `--visibility private --organization <current org>`, which is what makes
   `thread append` allowed (Delta rejects appends to unshared threads).
-- The thread id and title state live in `~/.pi/agent/delta-db/<session-id>.json`.
-- Each write asks `delta thread status` for the next sequence, and writes are serialized through
-  one queue, so records stay ordered.
+- The thread id, title, and next sequence live in `~/.pi/agent/delta-db/<session-id>.json`.
+- Sequence numbers are assigned locally before the send. Writes are serialized through one queue.
+- Recording stops if `delta thread contract` is outside contract 8.
 
 ## Install
 
@@ -101,6 +103,7 @@ Packages, and publishes to npmjs.org when the `NPM_TOKEN` secret is set
   remembered in the binding file.
 - Appends send records to Delta's cloud (private visibility) — not purely local storage.
 - Records are append-only: nothing can be overwritten or deleted individually.
+- A retry must resend the saved sequence. Renumbering from `thread status` stores a second copy.
 
 ## License
 
